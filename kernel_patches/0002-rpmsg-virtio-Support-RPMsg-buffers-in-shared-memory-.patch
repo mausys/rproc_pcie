@@ -1,0 +1,149 @@
+From 0669611a679ab2ef701ed28a1d6917c87623572d Mon Sep 17 00:00:00 2001
+From: Simon Maurer <mail@maurer.systems>
+Date: Fri, 6 Mar 2026 08:43:41 +0000
+Subject: [PATCH 2/2] rpmsg: virtio: Support RPMsg buffers in shared memory
+ without DMA
+
+Allow the RPMsg virtio transport to use a shared memory region provided
+via virtio_get_shm_region() instead of always allocating buffers with
+dma_alloc_coherent().
+
+If a shared memory region with id 0 is available, use it for the RPMsg
+buffer pool and skip DMA allocation. Otherwise fall back to the existing
+dma_alloc_coherent() path.
+
+Implement get_shm_region() in remoteproc_virtio to expose the
+"vdev%dbuffer" carveout when it is mapped as non-DMA memory.
+
+Signed-off-by: Simon Maurer <mail@maurer.systems>
+---
+ drivers/remoteproc/remoteproc_virtio.c | 27 ++++++++++++++++++-
+ drivers/rpmsg/virtio_rpmsg_bus.c       | 37 ++++++++++++++++++--------
+ 2 files changed, 52 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/remoteproc/remoteproc_virtio.c b/drivers/remoteproc/remoteproc_virtio.c
+index d5e9ff045a28..1763231e0979 100644
+--- a/drivers/remoteproc/remoteproc_virtio.c
++++ b/drivers/remoteproc/remoteproc_virtio.c
+@@ -210,6 +210,30 @@ static int rproc_virtio_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
+ 	return ret;
+ }
+ 
++static bool rproc_virtio_get_shm_region(struct virtio_device *vdev,
++				struct virtio_shm_region *region, uint8_t id)
++{
++	struct rproc_vdev *rvdev = vdev_to_rvdev(vdev);
++	struct rproc *rproc = rvdev->rproc;
++	struct rproc_mem_entry *mem;
++
++	if (id != 0)
++		return false;
++
++	mem = rproc_find_carveout_by_name(rproc, "vdev%dbuffer", rvdev->index);
++	if (!mem || !mem->va)
++		return false;
++
++	/* only handle non-DMA memory */
++	if (mem->dma != DMA_MAPPING_ERROR)
++		return false;
++
++	region->addr = (u64)mem->va;
++	region->len = mem->len;
++
++	return true;
++}
++
+ static u8 rproc_virtio_get_status(struct virtio_device *vdev)
+ {
+ 	struct rproc_vdev *rvdev = vdev_to_rvdev(vdev);
+@@ -328,6 +352,7 @@ static const struct virtio_config_ops rproc_virtio_config_ops = {
+ 	.get_features	= rproc_virtio_get_features,
+ 	.finalize_features = rproc_virtio_finalize_features,
+ 	.find_vqs	= rproc_virtio_find_vqs,
++	.get_shm_region	= rproc_virtio_get_shm_region,
+ 	.del_vqs	= rproc_virtio_del_vqs,
+ 	.reset		= rproc_virtio_reset,
+ 	.set_status	= rproc_virtio_set_status,
+@@ -396,7 +421,7 @@ static int rproc_add_virtio_dev(struct rproc_vdev *rvdev, int id)
+ 				dev_err(dev, "Can't associate reserved memory\n");
+ 				goto out;
+ 			}
+-		} else {
++		} else if (mem->dma != DMA_MAPPING_ERROR) {
+ 			if (mem->va) {
+ 				dev_warn(dev, "vdev %d buffer already mapped\n",
+ 					 rvdev->index);
+diff --git a/drivers/rpmsg/virtio_rpmsg_bus.c b/drivers/rpmsg/virtio_rpmsg_bus.c
+index 8d9e2b4dc7c1..cd37140aa626 100644
+--- a/drivers/rpmsg/virtio_rpmsg_bus.c
++++ b/drivers/rpmsg/virtio_rpmsg_bus.c
+@@ -817,6 +817,7 @@ static int rpmsg_probe(struct virtio_device *vdev)
+ 		{ "output", rpmsg_xmit_done },
+ 	};
+ 	struct virtqueue *vqs[2];
++	struct virtio_shm_region shm;
+ 	struct virtproc_info *vrp;
+ 	struct virtio_rpmsg_channel *vch = NULL;
+ 	struct rpmsg_device *rpdev_ns, *rpdev_ctrl;
+@@ -858,15 +859,27 @@ static int rpmsg_probe(struct virtio_device *vdev)
+ 
+ 	total_buf_space = vrp->num_bufs * vrp->buf_size;
+ 
+-	/* allocate coherent memory for the buffers */
+-	bufs_va = dma_alloc_coherent(vdev->dev.parent,
+-				     total_buf_space, &vrp->bufs_dma,
+-				     GFP_KERNEL);
+-	if (!bufs_va) {
+-		err = -ENOMEM;
+-		goto vqs_del;
++	if (virtio_get_shm_region(vdev, &shm, 0)) {
++		if (total_buf_space > shm.len) {
++			err = -ENOMEM;
++			goto vqs_del;
++		}
++
++		bufs_va = (void *)shm.addr;
++		vrp->bufs_dma = DMA_MAPPING_ERROR;
++
++		dev_dbg(&vdev->dev, "buffers: va %pK\n", bufs_va);
++	} else {
++		/* allocate coherent memory for the buffers */
++		bufs_va = dma_alloc_coherent(vdev->dev.parent,
++					  total_buf_space, &vrp->bufs_dma, GFP_KERNEL);
++		if (!bufs_va) {
++			err = -ENOMEM;
++			goto vqs_del;
++		}
+ 	}
+ 
++
+ 	dev_dbg(&vdev->dev, "buffers: va %p, dma %pad\n",
+ 		bufs_va, &vrp->bufs_dma);
+ 
+@@ -945,8 +958,9 @@ static int rpmsg_probe(struct virtio_device *vdev)
+ free_ctrldev:
+ 	rpmsg_virtio_del_ctrl_dev(rpdev_ctrl);
+ free_coherent:
+-	dma_free_coherent(vdev->dev.parent, total_buf_space,
+-			  bufs_va, vrp->bufs_dma);
++	if (vrp->bufs_dma != DMA_MAPPING_ERROR)
++		dma_free_coherent(vdev->dev.parent, total_buf_space,
++				bufs_va, vrp->bufs_dma);
+ vqs_del:
+ 	vdev->config->del_vqs(vrp->vdev);
+ free_vrp:
+@@ -977,8 +991,9 @@ static void rpmsg_remove(struct virtio_device *vdev)
+ 
+ 	vdev->config->del_vqs(vrp->vdev);
+ 
+-	dma_free_coherent(vdev->dev.parent, total_buf_space,
+-			  vrp->rbufs, vrp->bufs_dma);
++	if (vrp->bufs_dma != DMA_MAPPING_ERROR)
++		dma_free_coherent(vdev->dev.parent, total_buf_space,
++				vrp->rbufs, vrp->bufs_dma);
+ 
+ 	kfree(vrp);
+ }
+-- 
+2.53.0
+

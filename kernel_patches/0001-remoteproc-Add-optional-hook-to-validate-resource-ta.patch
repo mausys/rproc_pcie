@@ -1,0 +1,64 @@
+From 29a6edda8b7a3b36cbcce1475451d588837e5b2f Mon Sep 17 00:00:00 2001
+From: Simon Maurer <mail@maurer.systems>
+Date: Fri, 6 Mar 2026 08:41:44 +0000
+Subject: [PATCH 1/2] remoteproc: Add optional hook to validate resource table
+
+Add an optional rproc_ops->fixup_rsc() hook that is invoked after the
+resource table has been parsed but before carveout resources are
+allocated.
+
+This allows platform drivers to validate or adjust resource table
+entries and perform additional checks before the core allocates the
+registered carveouts.
+
+If the hook returns an error, the boot process is aborted and resource
+cleanup is performed.
+
+Signed-off-by: Simon Maurer <mail@maurer.systems>
+---
+ drivers/remoteproc/remoteproc_core.c | 6 ++++++
+ include/linux/remoteproc.h           | 4 ++++
+ 2 files changed, 10 insertions(+)
+
+diff --git a/drivers/remoteproc/remoteproc_core.c b/drivers/remoteproc/remoteproc_core.c
+index b087ed21858a..ffb594d5255c 100644
+--- a/drivers/remoteproc/remoteproc_core.c
++++ b/drivers/remoteproc/remoteproc_core.c
+@@ -1418,6 +1418,12 @@ static int rproc_fw_boot(struct rproc *rproc, const struct firmware *fw)
+ 		goto clean_up_resources;
+ 	}
+ 
++	if (rproc->ops->fixup_rsc) {
++		ret = rproc->ops->fixup_rsc(rproc);
++		if (ret)
++			goto clean_up_resources;
++	}
++
+ 	/* Allocate carveout resources associated to rproc */
+ 	ret = rproc_alloc_registered_carveouts(rproc);
+ 	if (ret) {
+diff --git a/include/linux/remoteproc.h b/include/linux/remoteproc.h
+index b4795698d8c2..466df9dbd050 100644
+--- a/include/linux/remoteproc.h
++++ b/include/linux/remoteproc.h
+@@ -371,6 +371,9 @@ enum rsc_handling_status {
+  * @handle_rsc:	optional platform hook to handle vendor resources. Should return
+  *		RSC_HANDLED if resource was handled, RSC_IGNORED if not handled
+  *		and a negative value on error
++ * @fixup_rsc:	optional platform hook to validate and fix up resources
++ *		before allocation. Return 0 if resources are acceptable after
++ *		fixups, negative error code otherwise.
+  * @find_loaded_rsc_table: find the loaded resource table from firmware image
+  * @get_loaded_rsc_table: get resource table installed in memory
+  *			  by external entity
+@@ -394,6 +397,7 @@ struct rproc_ops {
+ 	int (*parse_fw)(struct rproc *rproc, const struct firmware *fw);
+ 	int (*handle_rsc)(struct rproc *rproc, u32 rsc_type, void *rsc,
+ 			  int offset, int avail);
++	int (*fixup_rsc)(struct rproc *rproc);
+ 	struct resource_table *(*find_loaded_rsc_table)(
+ 				struct rproc *rproc, const struct firmware *fw);
+ 	struct resource_table *(*get_loaded_rsc_table)(
+-- 
+2.53.0
+

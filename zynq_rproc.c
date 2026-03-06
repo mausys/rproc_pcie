@@ -18,7 +18,6 @@
 #include <linux/reset.h>
 
 #include "remoteproc_internal.h"
-#include "remoteproc_elf_helpers.h"
 
 #define INTC_START_ADDRESS 0x10000
 
@@ -329,7 +328,7 @@ static int iter_vdev(struct device *dev, void *data)
 	return 0;
 }
 
-static int zynq_rproc_check_rsc(struct rproc *rproc)
+static int zynq_rproc_fixup_rsc(struct rproc *rproc)
 {
 	struct device *dev = &rproc->dev;
 	struct rproc_mem_entry *carveout = NULL;
@@ -358,7 +357,7 @@ static const struct rproc_ops zynq_rproc_ops = {
 	.da_to_va = zynq_rproc_da_to_va,
 	.load = rproc_elf_load_segments,
 	.parse_fw = rproc_elf_load_rsc_table,
-	.check_rsc = zynq_rproc_check_rsc,
+	.fixup_rsc = zynq_rproc_fixup_rsc,
 	.find_loaded_rsc_table = rproc_elf_find_loaded_rsc_table,
 	.sanity_check = rproc_elf_sanity_check,
 	.get_boot_addr = rproc_elf_get_boot_addr,
